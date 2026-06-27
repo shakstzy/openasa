@@ -30,6 +30,7 @@ import numpy as np
 # Configuration
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class MotilityThresholds:
     """Cutoffs for grading a single sperm track.
@@ -51,8 +52,11 @@ class MotilityThresholds:
     # ...or if it never leaves a small neighbourhood (microns of net travel).
     immotile_displacement_max: float = 5.0
     # Progressive requires BOTH a forward speed floor and a straightness floor.
-    progressive_vap_min: float = 25.0   # um/s
-    progressive_str_min: float = 80.0   # percent (VSL/VAP)
+    progressive_vap_min: float = 25.0  # um/s
+    # Lowered from 80% (clinical phase-contrast standard) to 50% to compensate
+    # for centroid jitter on phone brightfield optics, which systematically
+    # reduces apparent STR even for genuinely straight-swimming cells.
+    progressive_str_min: float = 50.0  # percent (VSL/VAP)
 
 
 @dataclass(frozen=True)
@@ -78,19 +82,20 @@ class CasaConfig:
 # Per-track results
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class TrackKinematics:
     n_frames: int
-    vcl: float          # curvilinear velocity (um/s)
-    vap: float          # average-path velocity (um/s)
-    vsl: float          # straight-line velocity (um/s)
-    lin: float          # linearity = VSL/VCL (%)
-    wob: float          # wobble    = VAP/VCL (%)
-    str: float          # straightness = VSL/VAP (%)
-    alh: float          # mean amplitude of lateral head displacement (um)
-    bcf: float          # beat-cross frequency (Hz)
+    vcl: float  # curvilinear velocity (um/s)
+    vap: float  # average-path velocity (um/s)
+    vsl: float  # straight-line velocity (um/s)
+    lin: float  # linearity = VSL/VCL (%)
+    wob: float  # wobble    = VAP/VCL (%)
+    str: float  # straightness = VSL/VAP (%)
+    alh: float  # mean amplitude of lateral head displacement (um)
+    bcf: float  # beat-cross frequency (Hz)
     net_displacement: float  # first->last point distance (um)
-    grade: str          # "progressive" | "non_progressive" | "immotile"
+    grade: str  # "progressive" | "non_progressive" | "immotile"
 
     @property
     def motile(self) -> bool:
@@ -110,6 +115,7 @@ class TrackKinematics:
 # ---------------------------------------------------------------------------
 # Geometry helpers
 # ---------------------------------------------------------------------------
+
 
 def _as_track(points: Sequence | np.ndarray) -> np.ndarray:
     arr = np.asarray(points, dtype=float)
@@ -155,12 +161,15 @@ def _point_segment_distance(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> floa
 
 def _segments_intersect(p1, p2, p3, p4) -> bool:
     """True if segment p1-p2 crosses segment p3-p4 (proper or touching)."""
+
     def orient(a, b, c):
         return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
 
     def on_seg(a, b, c):
-        return (min(a[0], b[0]) - 1e-9 <= c[0] <= max(a[0], b[0]) + 1e-9 and
-                min(a[1], b[1]) - 1e-9 <= c[1] <= max(a[1], b[1]) + 1e-9)
+        return (
+            min(a[0], b[0]) - 1e-9 <= c[0] <= max(a[0], b[0]) + 1e-9
+            and min(a[1], b[1]) - 1e-9 <= c[1] <= max(a[1], b[1]) + 1e-9
+        )
 
     d1, d2 = orient(p3, p4, p1), orient(p3, p4, p2)
     d3, d4 = orient(p1, p2, p3), orient(p1, p2, p4)
@@ -181,14 +190,21 @@ def _segments_intersect(p1, p2, p3, p4) -> bool:
 # Core kinematics
 # ---------------------------------------------------------------------------
 
-def compute_track(points: Sequence | np.ndarray, cfg: CasaConfig) -> TrackKinematics | None:
+
+def compute_track(
+    points: Sequence | np.ndarray, cfg: CasaConfig
+) -> TrackKinematics | None:
     """Compute WHO/CASA kinematics for a single track.
 
     Returns None if the track is too short to analyse.
     """
     track = _as_track(points)
     n = len(track)
-    if n < cfg.min_track_frames:
+    # Enforce a minimum duration of 0.5 s so BCF/ALH span enough beat cycles,
+    # regardless of frame rate. At 60 fps this is 30 frames; at 30 fps it
+    # matches the existing min_track_frames=10 floor only if fps<=20.
+    min_frames_needed = max(cfg.min_track_frames, int(0.5 * cfg.fps))
+    if n < min_frames_needed:
         return None
 
     mu = cfg.um_per_px
@@ -222,9 +238,17 @@ def compute_track(points: Sequence | np.ndarray, cfg: CasaConfig) -> TrackKinema
     grade = _grade(vap, strn, net_displacement, cfg.thresholds)
 
     return TrackKinematics(
-        n_frames=n, vcl=vcl, vap=vap, vsl=vsl,
-        lin=lin, wob=wob, str=strn, alh=alh, bcf=bcf,
-        net_displacement=net_displacement, grade=grade,
+        n_frames=n,
+        vcl=vcl,
+        vap=vap,
+        vsl=vsl,
+        lin=lin,
+        wob=wob,
+        str=strn,
+        alh=alh,
+        bcf=bcf,
+        net_displacement=net_displacement,
+        grade=grade,
     )
 
 
@@ -232,16 +256,15 @@ def _compute_alh(track: np.ndarray, avg: np.ndarray, mu: float) -> float:
     """Mean amplitude of lateral head displacement (um).
 
     For each raw point, distance to the nearest segment of the smoothed
-    average path; ALH is twice the mean of the local maxima of that signal
-    (full peak-to-peak), per the WHO/CASA convention.
+    average path. ALH is the mean of the local maxima of that signal
+    (midline-to-peak, half-amplitude), per the WHO/OpenCASA convention.
     """
     if len(avg) < 2:
         return 0.0
     dists = np.empty(len(track))
     for i, p in enumerate(track):
         seg_d = [
-            _point_segment_distance(p, avg[j], avg[j + 1])
-            for j in range(len(avg) - 1)
+            _point_segment_distance(p, avg[j], avg[j + 1]) for j in range(len(avg) - 1)
         ]
         dists[i] = min(seg_d)
     # Local maxima of the lateral-displacement signal.
@@ -252,7 +275,8 @@ def _compute_alh(track: np.ndarray, avg: np.ndarray, mu: float) -> float:
     ]
     if not peaks:
         peaks = [float(dists.max())]
-    return 2.0 * float(np.mean(peaks)) * mu
+    # midline-to-peak (not peak-to-peak): no factor of 2.
+    return float(np.mean(peaks)) * mu
 
 
 def _compute_bcf(track: np.ndarray, avg: np.ndarray, fps: float) -> float:
@@ -266,13 +290,17 @@ def _compute_bcf(track: np.ndarray, avg: np.ndarray, fps: float) -> float:
             if _segments_intersect(track[i], track[i + 1], avg[j], avg[j + 1]):
                 crossings += 1
                 break
-    span = (len(avg) - 1) / fps
+    # Use raw track duration (not the shorter avg path) so BCF isn't inflated
+    # by the (window-1) frames lost during smoothing.
+    span = (len(track) - 1) / fps
     return crossings / span if span > 0 else 0.0
 
 
-def _grade(vap: float, strn: float, net_disp: float,
-           t: MotilityThresholds) -> str:
-    if vap < t.immotile_vap_max or net_disp < t.immotile_displacement_max:
+def _grade(vap: float, strn: float, net_disp: float, t: MotilityThresholds) -> str:
+    # WHO defines immotile as NO detectable movement (Grade D). Circular
+    # swimmers (Grade C) have high VAP but low net displacement — they must
+    # NOT be graded immotile. Both thresholds must fail simultaneously.
+    if vap < t.immotile_vap_max and net_disp < t.immotile_displacement_max:
         return "immotile"
     if vap >= t.progressive_vap_min and strn >= t.progressive_str_min:
         return "progressive"

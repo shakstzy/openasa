@@ -19,9 +19,9 @@ from .casa import TrackKinematics
 
 
 # WHO 2021 (6th ed.) lower reference limits (5th percentile of fertile men).
-WHO6_CONCENTRATION_MIN = 16.0   # million/mL
+WHO6_CONCENTRATION_MIN = 16.0  # million/mL
 WHO6_TOTAL_MOTILITY_MIN = 42.0  # percent
-WHO6_PROGRESSIVE_MIN = 30.0     # percent
+WHO6_PROGRESSIVE_MIN = 30.0  # percent
 
 
 @dataclass
@@ -41,6 +41,9 @@ class SemenReport:
     mean_lin: float
     flags: dict
     notes: list
+    # Morphology (optional; None when morph_weights not configured).
+    morphology_normal_pct: float | None = None
+    morphology_n_classified: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -53,6 +56,8 @@ def _pct(part: int, whole: int) -> float:
 def build_report(
     tracks: list[TrackKinematics],
     concentration_m_per_ml: float | None = None,
+    morphology_normal_pct: float | None = None,
+    morphology_n_classified: int = 0,
 ) -> SemenReport:
     n = len(tracks)
     motile = [t for t in tracks if t.motile]
@@ -71,7 +76,11 @@ def build_report(
         prog_conc = concentration_m_per_ml * prog / 100.0
 
     def _mean(attr: str) -> float:
-        return float(sum(getattr(t, attr) for t in motile) / len(motile)) if motile else 0.0
+        return (
+            float(sum(getattr(t, attr) for t in motile) / len(motile))
+            if motile
+            else 0.0
+        )
 
     flags = {
         "concentration_below_who": (
@@ -99,12 +108,18 @@ def build_report(
         progressive_motility_pct=round(prog, 1),
         non_progressive_pct=round(non_prog_pct, 1),
         immotile_pct=round(immotile_pct, 1),
-        motile_concentration_m_per_ml=(round(motile_conc, 1) if motile_conc is not None else None),
-        progressive_concentration_m_per_ml=(round(prog_conc, 1) if prog_conc is not None else None),
+        motile_concentration_m_per_ml=(
+            round(motile_conc, 1) if motile_conc is not None else None
+        ),
+        progressive_concentration_m_per_ml=(
+            round(prog_conc, 1) if prog_conc is not None else None
+        ),
         mean_vcl=round(_mean("vcl"), 1),
         mean_vap=round(_mean("vap"), 1),
         mean_vsl=round(_mean("vsl"), 1),
         mean_lin=round(_mean("lin"), 1),
         flags=flags,
         notes=notes,
+        morphology_normal_pct=morphology_normal_pct,
+        morphology_n_classified=morphology_n_classified,
     )

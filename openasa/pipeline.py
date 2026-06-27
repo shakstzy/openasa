@@ -31,19 +31,23 @@ from .report import SemenReport, build_report
 
 @dataclass
 class PipelineConfig:
-    weights: str                 # path to YOLO sperm-detector weights
-    casa: CasaConfig             # optical scale, fps, thresholds
-    chamber_depth_um: float = 20.0   # disposable Leja/Cell-Vu default
+    weights: str  # path to YOLO sperm-detector weights
+    casa: CasaConfig  # optical scale, fps, thresholds
+    chamber_depth_um: float = 20.0  # disposable Leja/Cell-Vu default
     dilution_factor: float = 1.0
-    conf: float = 0.25           # detector confidence floor
+    conf: float = 0.25  # detector confidence floor
     iou: float = 0.5
     tracker: str = "bytetrack.yaml"
     imgsz: int = 640
-    device: str | None = None    # e.g. "cuda:0" on the Spark, None = auto
+    device: str | None = None  # e.g. "cuda:0" on the Spark, None = auto
     # Class id of "sperm" in the detector, or None to accept all detections.
     sperm_class_id: int | None = None
     # Path to EfficientNet-B0 morphology weights; None = skip morphology step.
     morph_weights: str | None = None
+    # Resolution (width) at which um_per_px was physically calibrated.
+    # When the input video differs, um_per_px is scaled proportionally so
+    # that concentration and velocities remain correct at any phone resolution.
+    calib_width_px: int = 640
 
 
 def analyze_video(video_path: str, pcfg: PipelineConfig) -> SemenReport:
@@ -59,11 +63,19 @@ def analyze_video(video_path: str, pcfg: PipelineConfig) -> SemenReport:
     # This prevents the 67% velocity error when the config fps != the actual recording fps.
     import cv2 as _cv2
     import dataclasses as _dc
+
     _cap = _cv2.VideoCapture(video_path)
     _video_fps = _cap.get(_cv2.CAP_PROP_FPS)
+    _actual_w = int(_cap.get(_cv2.CAP_PROP_FRAME_WIDTH))
     _cap.release()
     if _video_fps > 0 and abs(_video_fps - pcfg.casa.fps) > 0.5:
         pcfg.casa = _dc.replace(pcfg.casa, fps=_video_fps)
+    # Scale um_per_px when the video resolution differs from the calibration
+    # resolution. A 4K phone recording has 6x smaller um/px than a 640-px
+    # calibration frame; without this, concentration and all velocities are wrong.
+    if _actual_w > 0 and _actual_w != pcfg.calib_width_px:
+        _scale = pcfg.calib_width_px / _actual_w
+        pcfg.casa = _dc.replace(pcfg.casa, um_per_px=pcfg.casa.um_per_px * _scale)
 
     model = YOLO(pcfg.weights)
     results = model.track(
@@ -120,6 +132,8 @@ def analyze_video(video_path: str, pcfg: PipelineConfig) -> SemenReport:
             if k:
                 tracks[int(tid)].append((float(x), float(y)))
 
+    # Drop tracks shorter than 5 frames — too brief for reliable CASA metrics.
+    tracks = {k: v for k, v in tracks.items() if len(v) >= 5}
     kinematics = [compute_track(t, pcfg.casa) for t in tracks.values()]
     kinematics = [k for k in kinematics if k is not None]
 
@@ -157,7 +171,9 @@ def _classify_morphology(
     from torchvision.models import efficientnet_b0
     from PIL import Image
 
-    dev = torch.device(device if device else ("cuda:0" if torch.cuda.is_available() else "cpu"))
+    dev = torch.device(
+        device if device else ("cuda:0" if torch.cuda.is_available() else "cpu")
+    )
 
     # Build model and load weights
     morph_model = efficientnet_b0(weights=None)
@@ -165,11 +181,13 @@ def _classify_morphology(
     morph_model.load_state_dict(torch.load(morph_weights, map_location=dev))
     morph_model.to(dev).eval()
 
-    tf = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    tf = transforms.Compose(
+        [
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
 
     crops = []
     for _tid, entry in track_best_frame.items():
@@ -179,7 +197,21 @@ def _classify_morphology(
         x2, y2 = min(w, x2), min(h, y2)
         if x2 <= x1 or y2 <= y1:
             continue
-        crop_bgr = frame_bgr[y1:y2, x1:x2]
+        # Pad crop by 4 px to give the model a little context around the head.
+        PAD = 4
+        crop_bgr = frame_bgr[
+            max(0, y1 - PAD) : min(h, y2 + PAD),
+            max(0, x1 - PAD) : min(w, x2 + PAD),
+        ]
+        # CLAHE on the L channel: bridges brightfield phone video ->
+        # Papanicolaou-stained training data domain gap.
+        import cv2 as _cv2
+
+        _lab = _cv2.cvtColor(crop_bgr, _cv2.COLOR_BGR2LAB)
+        _l, _a, _b = _cv2.split(_lab)
+        _clahe = _cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        _l = _clahe.apply(_l)
+        crop_bgr = _cv2.cvtColor(_cv2.merge([_l, _a, _b]), _cv2.COLOR_LAB2BGR)
         # Convert BGR -> RGB PIL
         crop_rgb = crop_bgr[:, :, ::-1].copy()
         pil = Image.fromarray(crop_rgb)
@@ -202,7 +234,7 @@ def _class_mask(boxes, sperm_class_id: int | None) -> np.ndarray:
     n = len(boxes)
     if sperm_class_id is None or boxes.cls is None:
         return np.ones(n, dtype=bool)
-    return (boxes.cls.int().cpu().numpy() == sperm_class_id)
+    return boxes.cls.int().cpu().numpy() == sperm_class_id
 
 
 def _estimate_concentration(
